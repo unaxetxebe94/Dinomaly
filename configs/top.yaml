@@ -1,0 +1,74 @@
+# Dinomaly on the "Top" COCO dataset.
+#
+# Add more annotated folders under data.sources to train/evaluate a single
+# multi-source model; splits are grouped by source image so tiles from the
+# same scan never leak across train/val/test.
+
+project:
+  name: top
+  seed: 42
+
+data:
+  sources:
+    - name: top
+      root: "/run/media/unaxetxebe/My Passport/Images for labelling/Top"
+      annotations: "_annotations.coco.bak"
+    # Add more annotated folders here to train/evaluate a single multi-source
+    # model, e.g.:
+    - name: bottom
+      root: "/run/media/unaxetxebe/My Passport1/Images for labelling/Bottom"
+      annotations: "_annotations.coco.bak"
+  # Tiles, masks, manifest.parquet and classes.json are written here.
+  tiles_dir: "data/tiles_top"
+  tile_size: 1024
+  tile_overlap: 128      # stride = 1024 - 128 = 896 px (12.5% overlap)
+  jpeg_quality: 92
+  min_std: 3.0           # skip (near) uniform background tiles; defect tiles are always kept
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  # Model input resolution (DINOv2 patch size is 14 -> 392 = 28x28 tokens).
+  crop_size: 392
+  train_min_scale: 0.6
+  rotation: false
+  num_workers: 6
+
+model:
+  name: dinov2reg_vit_base_14   # small / base / large, with or without registers
+  encoder:
+    pretrained: true
+    img_size: 518               # DINOv2 positional-embedding reference size
+  target_layers: [2, 3, 4, 5, 6, 7, 8, 9]
+  fuse_layer_encoder: [[0, 1, 2, 3], [4, 5, 6, 7]]
+  fuse_layer_decoder: [[0, 1, 2, 3], [4, 5, 6, 7]]
+  decoder_blocks: 8
+  decoder_mlp_ratio: 4.0
+  bottleneck_drop: 0.2
+  bottleneck_ratio: 4.0
+
+train:
+  total_iters: 10000
+  batch_size: 16
+  lr: 2.0e-3
+  final_lr: 2.0e-4
+  warmup_iters: 100
+  weight_decay: 1.0e-4
+  optimizer_eps: 1.0e-10       # same as official StableAdamW
+  amsgrad: true
+  grad_clip: 0.1
+  hard_mining_p: 0.9
+  hard_mining_factor: 0.1
+  amp: false                   # fp32 is the stable default; set true on fast GPUs
+  save_every: 500              # periodic last.pt, independent of eval_every
+  gaussian_sigma: 4.0
+  eval_every: 1000
+  max_eval_tiles: 2500          # val subset: all defect tiles + random normal tiles
+  select_metric: "image.auroc"
+  score_ratio: 0.01             # tile score = mean of top 1% anomaly-map pixels
+  image_topk: 1                 # source-image score = mean of top-k tile scores
+  pro_max_tiles: 500
+  pro_size: 128
+  pro_thresholds: 100
+  log_every: 50
+  checkpoint_dir: "runs/top"

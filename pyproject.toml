@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dinomaly-tiles"
+version = "0.1.0"
+description = "Dinomaly training/evaluation on tiled large-format images with COCO polygon annotations"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.7",
+    "torchvision>=0.22",
+    "timm>=1.0.15",
+    "numpy>=1.26,<2.3",
+    "pandas>=2.2",
+    "pyarrow>=17",
+    "pillow>=10.4",
+    "pyvips>=3.0",
+    "scikit-learn>=1.5",
+    "scipy>=1.13",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["dinomaly"]
+
+[tool.uv]
+package = true
