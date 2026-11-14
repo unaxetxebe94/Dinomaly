@@ -138,6 +138,7 @@ def main() -> None:
             pro_thresholds=int(train_cfg.get("pro_thresholds", 100)),
         )
         started = time.time()
+        error_tiles = int(train_cfg.get("save_error_tiles", 50))
         test_metrics = evaluate_loader(
             model,
             test_loader,
@@ -147,12 +148,22 @@ def main() -> None:
             pixel_threshold=checkpoint.get("pixel_threshold"),
             amp=bool(train_cfg.get("amp", True)),
             gaussian_sigma=float(train_cfg.get("gaussian_sigma", 4.0)),
+            error_dir=run_dir / "test_errors" if error_tiles > 0 else None,
+            error_tiles=error_tiles,
         )
         test_metrics["elapsed_seconds"] = round(time.time() - started, 1)
         test_metrics["checkpoint"] = str(run_dir / "best.pt")
         test_metrics["pixel_threshold"] = checkpoint.get("pixel_threshold")
         save_json(test_metrics, run_dir / "test_metrics.json")
         logger.info(f"Test: {format_metrics(test_metrics)}")
+        errors = test_metrics.get("errors")
+        if errors and errors.get("dir"):
+            logger.info(
+                f"Test error tiles: FP={errors.get('saved_false_positives', 0)}/"
+                f"{errors.get('false_positive_tiles_total', 0)} "
+                f"FN={errors.get('saved_false_negatives', 0)}/"
+                f"{errors.get('false_negative_tiles_total', 0)} -> {errors['dir']}"
+            )
 
     logger.info(f"Artifacts written to {run_dir.resolve()}")
 

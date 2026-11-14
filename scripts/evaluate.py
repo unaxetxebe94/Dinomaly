@@ -38,6 +38,17 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=None, help="Pixel threshold for F1 (default: checkpoint val threshold)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument(
+        "--error-tiles",
+        type=int,
+        default=50,
+        help="Save this many worst false positives and false negatives per split (0 = off)",
+    )
+    parser.add_argument(
+        "--errors-dir",
+        default=None,
+        help="Where to write error tiles/mosaics (default: <checkpoint dir>/<split>_errors)",
+    )
     parser.add_argument("--out", default=None)
     parser.add_argument("--set", action="append", default=[])
     args = parser.parse_args()
@@ -95,6 +106,13 @@ def main() -> None:
         )
         dataset = TileDataset(subset, tiles_dir, crop_size=crop_size, train=False, return_mask=True)
         loader = make_loader(dataset, batch_size, shuffle=False, num_workers=workers)
+        errors_dir = None
+        if args.error_tiles > 0:
+            errors_dir = (
+                Path(args.errors_dir) / split
+                if args.errors_dir
+                else Path(args.checkpoint).parent / f"{split}_errors"
+            )
         result = evaluate_loader(
             model,
             loader,
@@ -104,6 +122,8 @@ def main() -> None:
             pixel_threshold=threshold,
             amp=bool(train_cfg.get("amp", True)),
             gaussian_sigma=float(train_cfg.get("gaussian_sigma", 4.0)),
+            error_dir=errors_dir,
+            error_tiles=args.error_tiles,
         )
         result["split"] = split
         result["checkpoint"] = args.checkpoint
@@ -111,6 +131,14 @@ def main() -> None:
         result["pixel_threshold"] = threshold
         all_results[split] = result
         logger.info(f"{split.upper()}: {format_metrics(result)}")
+        errors = result.get("errors")
+        if errors and errors.get("dir"):
+            logger.info(
+                f"{split.upper()} error tiles: "
+                f"FP={errors.get('saved_false_positives', 0)}/{errors.get('false_positive_tiles_total', 0)} "
+                f"FN={errors.get('saved_false_negatives', 0)}/{errors.get('false_negative_tiles_total', 0)} "
+                f"-> {errors['dir']}"
+            )
         if result.get("pixel", {}).get("per_category"):
             logger.info("Per-category pixel AP (AP / AUROC):")
             for name, values in sorted(result["pixel"]["per_category"].items(), key=lambda kv: kv[1].get("ap") or -1):

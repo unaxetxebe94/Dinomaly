@@ -11,12 +11,16 @@ Tile grid notes
   back so it stays inside the image).  This avoids padded borders.
 * ``tile_overlap`` < ``tile_size`` gives a stride of ``tile_size - overlap``;
   overlapping tiles are averaged when maps are stitched back together.
+* Only tiles that intersect the detected object (``data.roi``) are produced;
+  the black border of the scan is ignored.  See :mod:`dinomaly.roi`.
 """
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
+import shutil
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -31,6 +35,7 @@ from PIL import Image, ImageDraw
 from tqdm import tqdm
 
 from .coco import CocoDataset, CocoImage, annotation_bboxes_intersect_tile, load_coco
+from .roi import Roi, RoiSettings, compute_roi
 from .utils import save_json
 
 # Keep libvips' decoded-image cache small when several workers run in parallel.
@@ -51,6 +56,7 @@ class TileJob:
     jpeg_quality: int
     min_std: float
     category_map: dict[int, int]
+    roi: RoiSettings
 
 
 def tile_positions(length: int, tile_size: int, overlap: int) -> list[int]:
@@ -61,6 +67,20 @@ def tile_positions(length: int, tile_size: int, overlap: int) -> list[int]:
     if positions[-1] != length - tile_size:
         positions.append(length - tile_size)
     return positions
+
+
+def positions_in_roi(
+    length: int, tile_size: int, overlap: int, start: int, end: int
+) -> list[int]:
+    """Grid positions whose tile intersects the ``[start, end)`` span.
+
+    The full-image grid is kept (nothing is realigned), so a tile can stick out
+    of the object; that only adds a little background and keeps every tile the
+    exact ``tile_size``.  Tiles are still guaranteed to lie inside the image.
+    """
+    positions = tile_positions(length, tile_size, overlap)
+    inside = [p for p in positions if p + tile_size > start and p < end]
+    return inside or positions
 
 
 def assign_splits(
@@ -148,7 +168,13 @@ def process_image(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Create all tiles/masks for one source image.  Returns manifest rows + stats."""
     img_path = job.image.path
-    stats = {"image": str(img_path), "tiles": 0, "skipped_blank": 0, "error": None}
+    stats = {
+        "image": str(img_path),
+        "tiles": 0,
+        "skipped_blank": 0,
+        "roi": None,
+        "error": None,
+    }
     try:
         img = pyvips.Image.new_from_file(str(img_path), access="random")
     except Exception as exc:  # noqa: BLE001 - corrupt files should not kill the run
@@ -165,8 +191,41 @@ def process_image(
     width, height = int(img.width), int(img.height)
     size = job.tile_size
     overlap = job.overlap
-    xs = tile_positions(width, size, overlap)
-    ys = tile_positions(height, size, overlap)
+
+    # Tiles are only produced around the scanned object; the black border of
+    # the canvas is ignored.  A failed detection falls back to the full image.
+    roi: Roi | None = None
+    if job.roi.enabled:
+        try:
+            roi = compute_roi(img_path, job.roi)
+        except Exception as exc:  # noqa: BLE001 - never lose an image over the ROI
+            stats["roi_error"] = f"roi detection failed: {exc}"
+    if roi is not None:
+        stats["roi"] = roi.to_dict()
+        xs = positions_in_roi(width, size, overlap, roi.x0, roi.x1)
+        ys = positions_in_roi(height, size, overlap, roi.y0, roi.y1)
+    else:
+        if job.roi.enabled:
+            stats["roi"] = {"fallback": "full image"}
+        xs = tile_positions(width, size, overlap)
+        ys = tile_positions(height, size, overlap)
+
+    pairs = [(x, y) for y in ys for x in xs]
+    if roi is not None and anns:
+        # Never lose an annotated region: if a polygon falls (partly) outside
+        # the detected box, add the tiles that touch it.
+        extra: set[tuple[int, int]] = set()
+        for ann in anns:
+            bx, by, bw, bh = ann.bbox
+            axs = positions_in_roi(width, size, overlap, int(bx), int(np.ceil(bx + bw)))
+            ays = positions_in_roi(height, size, overlap, int(by), int(np.ceil(by + bh)))
+            extra.update((x, y) for y in ays for x in axs)
+        if extra:
+            known = set(pairs)
+            added = sorted(extra - known, key=lambda p: (p[1], p[0]))
+            if added:
+                stats["tiles_outside_roi_for_annotations"] = len(added)
+                pairs.extend(added)
 
     split_dir = out_dir / "tiles" / job.split
     mask_dir = out_dir / "masks" / job.split
@@ -174,65 +233,68 @@ def process_image(
     mask_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, Any]] = []
-    for y in ys:
-        for x in xs:
-            tile = _tile_image(img, x, y, size)
-            mask = rasterize_tile_mask(anns, x, y, size, size, job.category_map)
-            defect_pixels = int(np.count_nonzero(mask))
+    for x, y in pairs:
+        tile = _tile_image(img, x, y, size)
+        mask = rasterize_tile_mask(anns, x, y, size, size, job.category_map)
+        defect_pixels = int(np.count_nonzero(mask))
 
-            if defect_pixels == 0 and job.min_std > 0:
-                try:
-                    if float(tile.deviate()) < job.min_std:
-                        stats["skipped_blank"] += 1
-                        continue
-                except pyvips.error.Error:
-                    pass
+        if defect_pixels == 0 and job.min_std > 0:
+            try:
+                if float(tile.deviate()) < job.min_std:
+                    stats["skipped_blank"] += 1
+                    continue
+            except pyvips.error.Error:
+                pass
 
-            tile_id = f"{job.source}_{job.image.id:07d}_{y:06d}_{x:06d}"
-            tile_rel = Path("tiles") / job.split / f"{tile_id}.jpg"
-            tile_abs = out_dir / tile_rel
-            options = dict(JPEG_OPTIONS)
-            options["Q"] = int(job.jpeg_quality)
-            # The external USB drive occasionally returns a transient read
-            # error; one retry rescues the image instead of dropping it whole.
-            for attempt in range(2):
-                try:
-                    tile.jpegsave(str(tile_abs), **options)
-                    break
-                except pyvips.error.Error:
-                    if attempt == 1:
-                        raise
+        tile_id = f"{job.source}_{job.image.id:07d}_{y:06d}_{x:06d}"
+        tile_rel = Path("tiles") / job.split / f"{tile_id}.jpg"
+        tile_abs = out_dir / tile_rel
+        options = dict(JPEG_OPTIONS)
+        options["Q"] = int(job.jpeg_quality)
+        # The external USB drive occasionally returns a transient read
+        # error; one retry rescues the image instead of dropping it whole.
+        for attempt in range(2):
+            try:
+                tile.jpegsave(str(tile_abs), **options)
+                break
+            except pyvips.error.Error:
+                if attempt == 1:
+                    raise
 
-            mask_rel: str = ""
-            categories: list[int] = []
-            if defect_pixels:
-                values = np.unique(mask)
-                categories = sorted(int(v) for v in values if v > 0)
-                mask_rel = str(Path("masks") / job.split / f"{tile_id}.png")
-                Image.fromarray(mask).save(out_dir / mask_rel, optimize=True)
+        mask_rel: str = ""
+        categories: list[int] = []
+        if defect_pixels:
+            values = np.unique(mask)
+            categories = sorted(int(v) for v in values if v > 0)
+            mask_rel = str(Path("masks") / job.split / f"{tile_id}.png")
+            Image.fromarray(mask).save(out_dir / mask_rel, optimize=True)
 
-            rows.append(
-                {
-                    "tile_id": tile_id,
-                    "source": job.source,
-                    "image_id": int(job.image.id),
-                    "image_uid": f"{job.source}:{job.image.id}",
-                    "file_name": job.image.file_name,
-                    "split": job.split,
-                    "x": int(x),
-                    "y": int(y),
-                    "w": int(size),
-                    "h": int(size),
-                    "image_width": width,
-                    "image_height": height,
-                    "tile_path": str(tile_rel),
-                    "mask_path": mask_rel,
-                    "has_defect": defect_pixels > 0,
-                    "defect_pixels": defect_pixels,
-                    "categories": categories,
-                }
-            )
-            stats["tiles"] += 1
+        rows.append(
+            {
+                "tile_id": tile_id,
+                "source": job.source,
+                "image_id": int(job.image.id),
+                "image_uid": f"{job.source}:{job.image.id}",
+                "file_name": job.image.file_name,
+                "split": job.split,
+                "x": int(x),
+                "y": int(y),
+                "w": int(size),
+                "h": int(size),
+                "image_width": width,
+                "image_height": height,
+                "roi_x0": int(roi.x0) if roi else 0,
+                "roi_y0": int(roi.y0) if roi else 0,
+                "roi_x1": int(roi.x1) if roi else width,
+                "roi_y1": int(roi.y1) if roi else height,
+                "tile_path": str(tile_rel),
+                "mask_path": mask_rel,
+                "has_defect": defect_pixels > 0,
+                "defect_pixels": defect_pixels,
+                "categories": categories,
+            }
+        )
+        stats["tiles"] += 1
     return rows, stats
 
 
@@ -262,6 +324,19 @@ def build_category_map(datasets: list[CocoDataset]) -> tuple[dict[int, int], lis
     return category_map, classes
 
 
+def _roi_coverage(df: pd.DataFrame) -> float | None:
+    """Mean fraction of each image covered by the ROI box (``None`` if unknown)."""
+    cols = {"roi_x0", "roi_y0", "roi_x1", "roi_y1", "image_width", "image_height"}
+    if df.empty or not cols.issubset(df.columns):
+        return None
+    per_image = df.groupby("image_uid")[sorted(cols)].first()
+    roi_area = (per_image["roi_x1"] - per_image["roi_x0"]) * (
+        per_image["roi_y1"] - per_image["roi_y0"]
+    )
+    image_area = per_image["image_width"] * per_image["image_height"]
+    return round(float((roi_area / image_area).astype(float).mean()), 6)
+
+
 def build_tiles(
     config: dict[str, Any],
     tiles_dir: str | os.PathLike,
@@ -282,9 +357,53 @@ def build_tiles(
     overlap = int(data_cfg.get("tile_overlap", 128))
     jpeg_quality = int(data_cfg.get("jpeg_quality", 92))
     min_std = float(data_cfg.get("min_std", 0.0))
+    roi_cfg = RoiSettings.from_config(data_cfg.get("roi"))
 
     if overlap >= tile_size:
         raise ValueError("data.tile_overlap must be smaller than data.tile_size")
+
+    # Everything that changes the tile grid.  ``--resume`` refuses to append to
+    # a manifest built with other settings, otherwise one directory would mix
+    # incompatible tiles (and splits).
+    tiling_signature = {
+        "tile_size": tile_size,
+        "tile_overlap": overlap,
+        "jpeg_quality": jpeg_quality,
+        "min_std": min_std,
+        "roi": roi_cfg.to_dict(),
+        "sources": [
+            {
+                "name": str(s.get("name") or Path(s["root"]).name),
+                "root": str(s["root"]),
+                "annotations": str(s.get("annotations", "_annotations.coco.json")),
+            }
+            for s in data_cfg["sources"]
+        ],
+    }
+
+    if overwrite and manifest_path.exists():
+        log(f"--overwrite: deleting previous tiles, masks and manifest in {out_dir}")
+        for sub in ("tiles", "masks"):
+            shutil.rmtree(out_dir / sub, ignore_errors=True)
+        for name in ("manifest.parquet", "build_info.json", "roi_detection.json"):
+            (out_dir / name).unlink(missing_ok=True)
+
+    if resume and manifest_path.exists():
+        prev_info: dict[str, Any] = {}
+        if (out_dir / "build_info.json").exists():
+            prev_info = json.loads((out_dir / "build_info.json").read_text())
+        prev_signature = prev_info.get("tiling")
+        if prev_signature != tiling_signature:
+            changed = sorted(
+                key
+                for key in set(tiling_signature) | set(prev_signature or {})
+                if (prev_signature or {}).get(key) != tiling_signature.get(key)
+            )
+            raise SystemExit(
+                f"{out_dir} was built with different tiling settings (changed: {', '.join(changed)}). "
+                "Rebuild from scratch with --overwrite, or use a new --tiles-dir. "
+                "Tiles built with another grid cannot be mixed in one manifest."
+            )
 
     datasets: list[tuple[str, CocoDataset]] = []
     for source in data_cfg["sources"]:
@@ -324,6 +443,7 @@ def build_tiles(
                 jpeg_quality=jpeg_quality,
                 min_std=min_std,
                 category_map=category_map,
+                roi=roi_cfg,
             )
             jobs.append(job)
             annotations_by_job[job_key(job)] = dataset.annotations.get(image.id, [])
@@ -343,9 +463,15 @@ def build_tiles(
         raise RuntimeError("No images to tile")
 
     log(f"Tiling {len(jobs)} images with tile_size={tile_size}, overlap={overlap}, workers={workers}")
+    if roi_cfg.enabled:
+        log(
+            f"ROI crop enabled: threshold={roi_cfg.threshold}, select={roi_cfg.select}, "
+            f"margin={roi_cfg.margin}px -> only tiles around the scanned object"
+        )
     started = time.time()
     rows: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    roi_records: dict[str, dict[str, Any]] = {}
     # libvips/libtiff is not reliable when several threads decode huge TIFFs in
     # the same process (concurrent tiffload errors).  Worker *processes* each
     # own their libvips state and are stable; this also parallelises PNG mask
@@ -354,6 +480,14 @@ def build_tiles(
         for job, tile_rows, stats in results:
             if stats.get("error"):
                 failed.append({"image": job.image.file_name, "error": stats["error"]})
+            roi_info = stats.get("roi")
+            if roi_info is not None:
+                roi_records[job_key(job)] = {"file_name": job.image.file_name, **roi_info}
+            if stats.get("roi_error"):
+                roi_records[job_key(job)] = {
+                    "file_name": job.image.file_name,
+                    "error": stats["roi_error"],
+                }
             rows.extend(tile_rows)
 
     if workers <= 1:
@@ -396,10 +530,22 @@ def build_tiles(
         df = pd.concat([existing_df, df], ignore_index=True) if not df.empty else existing_df
     df.to_parquet(manifest_path, index=False)
 
+    roi_detection: dict[str, Any] = {}
+    if roi_records:
+        roi_path = out_dir / "roi_detection.json"
+        if roi_path.exists():
+            try:
+                roi_detection = json.loads(roi_path.read_text())
+            except json.JSONDecodeError:
+                roi_detection = {}
+        roi_detection.update(roi_records)
+        save_json(roi_detection, roi_path)
+
     elapsed = time.time() - started
     info = {
         "tiles_dir": str(out_dir.resolve()),
         "config": data_cfg,
+        "tiling": tiling_signature,
         "num_images": int(df["image_uid"].nunique()),
         "num_images_attempted": len(jobs),
         "resumed": existing_df is not None,
@@ -415,6 +561,14 @@ def build_tiles(
         "defect_tiles_by_split": df.groupby("split")["has_defect"].sum().astype(int).to_dict(),
         "created_at": pd.Timestamp.utcnow().isoformat(),
     }
+    info["roi_coverage_mean"] = _roi_coverage(df)
+    if roi_cfg.enabled:
+        info["roi_fallback_images"] = int(
+            sum(1 for record in roi_detection.values() if "fallback" in record)
+        )
+        info["roi_error_images"] = int(
+            sum(1 for record in roi_detection.values() if "error" in record)
+        )
     save_json(info, out_dir / "build_info.json")
     log(
         f"Done: {len(df)} tiles ({int(df['has_defect'].sum())} with defects) in {elapsed/60:.1f} min -> {manifest_path}"

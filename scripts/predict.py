@@ -25,7 +25,8 @@ from PIL import Image
 from dinomaly.data import build_transforms
 from dinomaly.engine import load_checkpoint
 from dinomaly.model import anomaly_maps, build_model
-from dinomaly.tiling import tile_positions
+from dinomaly.roi import RoiSettings, compute_roi
+from dinomaly.tiling import positions_in_roi, tile_positions
 from dinomaly.utils import (
     apply_overrides,
     load_config,
@@ -69,13 +70,25 @@ def predict_image(
     amp: bool = True,
     sigma: float = 4.0,
     batch_size: int = 16,
+    roi_settings: RoiSettings | None = None,
     logger=None,
 ) -> dict:
     log = logger.info if logger else print
     img = _to_rgb_vips(str(image_path))
     width, height = int(img.width), int(img.height)
-    xs = tile_positions(width, tile_size, overlap)
-    ys = tile_positions(height, tile_size, overlap)
+    roi = None
+    if roi_settings is not None and roi_settings.enabled:
+        try:
+            roi = compute_roi(image_path, roi_settings)
+        except Exception as exc:  # noqa: BLE001 - fall back to the full image
+            log(f"{image_path.name}: ROI detection failed ({exc}); using the full image")
+    if roi is not None:
+        xs = positions_in_roi(width, tile_size, overlap, roi.x0, roi.x1)
+        ys = positions_in_roi(height, tile_size, overlap, roi.y0, roi.y1)
+        log(f"{image_path.name}: ROI box=({roi.x0},{roi.y0})-({roi.x1},{roi.y1}) coverage={roi.coverage:.1%}")
+    else:
+        xs = tile_positions(width, tile_size, overlap)
+        ys = tile_positions(height, tile_size, overlap)
     positions = [(x, y) for y in ys for x in xs]
 
     out_tile = max(1, tile_size // downsample)
@@ -157,6 +170,7 @@ def predict_image(
         "heatmap_min": float(lo),
         "heatmap_max": float(hi),
         "num_tiles": len(records),
+        "roi": roi.to_dict() if roi is not None else None,
         "top_tiles": records[:20],
     }
     save_json(prediction, out_dir / "prediction.json")
@@ -214,6 +228,7 @@ def main() -> None:
         amp=bool(config.get("train", {}).get("amp", True)),
         sigma=float(config.get("train", {}).get("gaussian_sigma", 4.0)),
         batch_size=args.batch_size,
+        roi_settings=RoiSettings.from_config(data_cfg.get("roi")),
         logger=logger,
     )
 

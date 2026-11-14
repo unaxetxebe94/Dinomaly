@@ -11,13 +11,13 @@ project:
 data:
   sources:
     - name: top
-      root: "/run/media/unaxetxebe/My Passport/Images for labelling/Top"
-      annotations: "_annotations.coco.bak"
+      root: "/run/media/unaxetxebe/My Passport1/Images for labelling/Top"
+      annotations: "_annotations.coco.json"
     # Add more annotated folders here to train/evaluate a single multi-source
     # model, e.g.:
     - name: bottom
-      root: "/run/media/unaxetxebe/My Passport1/Images for labelling/Bottom"
-      annotations: "_annotations.coco.bak"
+      root: "/run/media/unaxetxebe/My Passport/Images for labelling/Bottom"
+      annotations: "_annotations.coco.json"
   # Tiles, masks, manifest.parquet and classes.json are written here.
   tiles_dir: "data/tiles_top"
   tile_size: 1024
@@ -30,6 +30,15 @@ data:
     test: 0.15
   # Model input resolution (DINOv2 patch size is 14 -> 392 = 28x28 tokens).
   crop_size: 392
+  # Recorte al objeto: se binariza el brillo (0-255), se agrupan las zonas
+  # conectadas y se queda la mayor ("la más ancha"). Solo se generan tiles que
+  # tocan esa caja; el borde negro del escaneo se ignora.
+  roi:
+    enabled: true
+    threshold: 30       # brillo mínimo para considerar objeto
+    select: width       # area | width | height
+    margin: 0           # píxeles extra alrededor de la caja
+    preview: 1024       # resolución de trabajo para las componentes conexas
   train_min_scale: 0.6
   rotation: false
   num_workers: 6
@@ -65,6 +74,7 @@ train:
   eval_every: 1000
   max_eval_tiles: 2500          # val subset: all defect tiles + random normal tiles
   select_metric: "image.auroc"
+  save_error_tiles: 50          # guarda los 50 peores FP y FN del test con heatmap
   score_ratio: 0.01             # tile score = mean of top 1% anomaly-map pixels
   image_topk: 1                 # source-image score = mean of top-k tile scores
   pro_max_tiles: 500
