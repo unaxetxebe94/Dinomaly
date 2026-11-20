@@ -5,21 +5,21 @@
 # same scan never leak across train/val/test.
 
 project:
-  name: top
+  name: top-bottom-dinomaly
   seed: 42
 
 data:
   sources:
     - name: top
-      root: "/run/media/unaxetxebe/My Passport1/Images for labelling/Top"
+      root: G:\B1375\DATA\Top
       annotations: "_annotations.coco.json"
     # Add more annotated folders here to train/evaluate a single multi-source
     # model, e.g.:
     - name: bottom
-      root: "/run/media/unaxetxebe/My Passport/Images for labelling/Bottom"
+      root: G:\B1375\DATA\Bottom
       annotations: "_annotations.coco.json"
   # Tiles, masks, manifest.parquet and classes.json are written here.
-  tiles_dir: "data/tiles_top"
+  tiles_dir: .\data\tiles_top-bottom
   tile_size: 1024
   tile_overlap: 128      # stride = 1024 - 128 = 896 px (12.5% overlap)
   jpeg_quality: 92
@@ -81,4 +81,4 @@ train:
   pro_size: 128
   pro_thresholds: 100
   log_every: 50
-  checkpoint_dir: "runs/top"
+  checkpoint_dir: "runs/top-bottom"
