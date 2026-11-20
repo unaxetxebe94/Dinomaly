@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +66,58 @@ def _polygons(segmentation: Any) -> list[list[float]] | None:
     return None
 
 
+_IMAGE_EXTENSIONS = (".tiff", ".tif", ".png", ".jpg", ".jpeg", ".bmp")
+_NUMERIC_PREFIX = re.compile(r"^\d+_(.+)$")
+
+
+def _disk_index(root: Path) -> dict[str, Path]:
+    """Map lower-case stems (with and without a ``<number>_`` prefix) to files.
+
+    The exported COCO files reference ``19359_top_native.jpg`` while the scans
+    on disk are ``<seq>_19359_top_native.tiff``; both spellings resolve here.
+    Exact stems win over prefix-stripped ones and TIFF over other formats.
+    """
+    exact: dict[str, Path] = {}
+    stripped: dict[str, list[Path]] = defaultdict(list)
+    rank = {ext: i for i, ext in enumerate(_IMAGE_EXTENSIONS)}
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return {}
+    for entry in entries:
+        if not entry.is_file():
+            continue
+        stem, ext = os.path.splitext(entry.name)
+        if ext.lower() not in rank:
+            continue
+        path = Path(entry.path)
+        key = stem.lower()
+        if key not in exact or rank[ext.lower()] < rank[exact[key].suffix.lower()]:
+            exact[key] = path
+        match = _NUMERIC_PREFIX.match(stem)
+        if match:
+            stripped[match.group(1).lower()].append(path)
+    index = dict(exact)
+    for key, paths in stripped.items():
+        if key in index:
+            continue
+        paths.sort(key=lambda p: rank[p.suffix.lower()])
+        best = [p for p in paths if p.suffix.lower() == paths[0].suffix.lower()]
+        if len(best) == 1:  # ambiguous prefixes are left unresolved
+            index[key] = best[0]
+    return index
+
+
+def resolve_image_path(root: Path, file_name: str, index: dict[str, Path] | None = None) -> Path:
+    direct = root / file_name
+    if direct.is_file():
+        return direct
+    if index is None:
+        index = _disk_index(root)
+    stem = Path(file_name.replace("\\", "/")).stem.lower()
+    return index.get(stem, direct)
+
+
 def load_coco(root: str | os.PathLike, annotation_file: str | os.PathLike) -> CocoDataset:
     root = Path(root)
     ann_path = Path(annotation_file)
@@ -74,14 +127,20 @@ def load_coco(root: str | os.PathLike, annotation_file: str | os.PathLike) -> Co
         data = json.load(fh)
 
     images: list[CocoImage] = []
+    index: dict[str, Path] | None = None
     for entry in data.get("images", []):
+        path = root / entry["file_name"]
+        if not path.is_file():
+            if index is None:
+                index = _disk_index(root)
+            path = resolve_image_path(root, entry["file_name"], index)
         images.append(
             CocoImage(
                 id=int(entry["id"]),
                 file_name=entry["file_name"],
                 width=int(entry.get("width", 0)),
                 height=int(entry.get("height", 0)),
-                path=root / entry["file_name"],
+                path=path,
             )
         )
 
