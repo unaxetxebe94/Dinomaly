@@ -774,6 +774,8 @@ def evaluate_loader(
     gaussian_sigma: float = 4.0,
     error_dir: str | Path | None = None,
     error_tiles: int = 0,
+    tile_threshold: float | None = None,
+    image_threshold: float | None = None,
 ) -> dict[str, Any]:
     from .model import anomaly_maps
 

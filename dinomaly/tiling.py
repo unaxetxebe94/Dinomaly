@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import random
 import shutil
 import time
 from collections.abc import Callable, Iterable
@@ -337,6 +338,35 @@ def _roi_coverage(df: pd.DataFrame) -> float | None:
     return round(float((roi_area / image_area).astype(float).mean()), 6)
 
 
+def _limit_per_split(
+    images: list[Any],
+    split_of: dict[int, str],
+    annotations: dict[int, list[Any]],
+    max_images: int,
+    seed: int,
+) -> list[Any]:
+    """Keep at most ``max_images`` per split, alternating defect / normal images.
+
+    Used for smoke tests (``data.max_images``): every split keeps both normal
+    and defective scans so image-level metrics stay defined.
+    """
+    rng = random.Random(seed)
+    kept: list[Any] = []
+    for split in ("train", "val", "test"):
+        pool = [im for im in images if split_of.get(im.id) == split]
+        defect = [im for im in pool if annotations.get(im.id)]
+        normal = [im for im in pool if not annotations.get(im.id)]
+        rng.shuffle(defect)
+        rng.shuffle(normal)
+        chosen: list[Any] = []
+        while len(chosen) < max_images and (defect or normal):
+            for bucket in (defect, normal):
+                if bucket and len(chosen) < max_images:
+                    chosen.append(bucket.pop())
+        kept.extend(chosen)
+    return kept
+
+
 def build_tiles(
     config: dict[str, Any],
     tiles_dir: str | os.PathLike,
@@ -358,6 +388,7 @@ def build_tiles(
     jpeg_quality = int(data_cfg.get("jpeg_quality", 92))
     min_std = float(data_cfg.get("min_std", 0.0))
     roi_cfg = RoiSettings.from_config(data_cfg.get("roi"))
+    max_images = data_cfg.get("max_images")
 
     if overlap >= tile_size:
         raise ValueError("data.tile_overlap must be smaller than data.tile_size")
@@ -380,6 +411,9 @@ def build_tiles(
             for s in data_cfg["sources"]
         ],
     }
+    if max_images is not None:
+        # Only present for subset builds so full builds keep their signature.
+        tiling_signature["max_images"] = int(max_images)
 
     if overwrite and manifest_path.exists():
         log(f"--overwrite: deleting previous tiles, masks and manifest in {out_dir}")
@@ -425,6 +459,8 @@ def build_tiles(
         if missing:
             log(f"[{source_name}] WARNING: {missing} annotated images are missing on disk")
         split_of = assign_splits(existing, dataset.annotations, ratios, seed)
+        if max_images is not None:
+            existing = _limit_per_split(existing, split_of, dataset.annotations, int(max_images), seed)
         if limit_images is not None:
             existing = existing[: int(limit_images)]
         log(

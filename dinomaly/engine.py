@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 from tqdm import tqdm
 
 from .losses import global_cosine_hm_percent
-from .metrics import EvalConfig, evaluate_loader, format_metrics
+from .metrics import EvalConfig, evaluate_loader, format_metrics, to_tracking_metrics
 from .model import Dinomaly
 from .utils import AverageMeter, save_json
 
@@ -69,6 +69,7 @@ def save_checkpoint(
     metrics: dict[str, Any] | None = None,
     image_threshold: float | None = None,
     score_name: str | None = None,
+    tile_threshold: float | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,6 +88,7 @@ def save_checkpoint(
             "best_score": best_score,
             "pixel_threshold": pixel_threshold,
             "image_threshold": image_threshold,
+            "tile_threshold": tile_threshold,
             "score_name": score_name,
             "config": config,
             "classes": classes,
@@ -140,6 +142,7 @@ class Trainer:
         run_dir: str | Path,
         classes: dict[int, str] | None = None,
         logger: Any = None,
+        tracker: Any = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -150,6 +153,7 @@ class Trainer:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.classes = classes
         self.log = logger.info if logger is not None else print
+        self.tracker = tracker
 
         train_cfg = config.get("train", {})
         self.total_iters = int(train_cfg.get("total_iters", 10000))
@@ -193,6 +197,7 @@ class Trainer:
         self.score_name = self.select_metric
         self.pixel_threshold: float | None = None
         self.image_threshold: float | None = None
+        self.tile_threshold: float | None = None
         self.history_path = self.run_dir / "history.csv"
         self.history_header = [
             "iteration",
@@ -225,6 +230,7 @@ class Trainer:
         self.best_score = float(checkpoint.get("best_score", -math.inf))
         self.pixel_threshold = checkpoint.get("pixel_threshold")
         self.image_threshold = checkpoint.get("image_threshold")
+        self.tile_threshold = checkpoint.get("tile_threshold")
         self.score_name = checkpoint.get("score_name") or self.select_metric
         self.log(
             f"Resumed from {checkpoint_path} at iter {self.iteration} "
@@ -248,6 +254,9 @@ class Trainer:
         self.image_threshold = result["image"].get("best_threshold")
         if self.image_threshold is not None and not np.isfinite(self.image_threshold):
             self.image_threshold = None
+        self.tile_threshold = result["tile"].get("threshold")
+        if self.tile_threshold is not None and not np.isfinite(self.tile_threshold):
+            self.tile_threshold = None
         return result
 
     def _save(self, name: str, metrics: dict[str, Any] | None = None) -> None:
@@ -264,6 +273,7 @@ class Trainer:
             metrics=metrics,
             image_threshold=self.image_threshold,
             score_name=self.score_name,
+            tile_threshold=self.tile_threshold,
         )
 
     def fit(self) -> dict[str, Any]:
@@ -351,6 +361,17 @@ class Trainer:
                     f"grad={grad_norm:.2e} skipped={skipped} "
                     f"lr={lr:.2e} {self.log_every/(now-last_log):.1f} it/s"
                 )
+                if self.tracker is not None:
+                    self.tracker.log_metrics(
+                        {
+                            "train/loss": meter.avg,
+                            "train/lr": lr,
+                            "train/grad_norm": grad_norm,
+                            "train/skipped_steps": skipped,
+                            "train/it_per_sec": self.log_every / max(now - last_log, 1e-9),
+                        },
+                        step=self.iteration,
+                    )
                 meter = AverageMeter()
                 last_log = now
 
@@ -380,6 +401,7 @@ class Trainer:
                     f"({score_name}={score:.4f}{' *best*' if is_best else ''})"
                 )
                 self._append_history(metrics)
+                self._track_val(metrics, score_name, score)
                 self._save("last.pt", metrics)
                 if is_best:
                     self._save("best.pt", metrics)
@@ -388,6 +410,7 @@ class Trainer:
         if not last_metrics:
             last_metrics = self.evaluate()
             self._append_history(last_metrics)
+            self._track_val(last_metrics, self.select_metric, _get_metric(last_metrics, self.select_metric))
         self._save("last.pt", last_metrics)
         if not np.isfinite(self.best_score):
             score_name = self.select_metric
@@ -404,6 +427,15 @@ class Trainer:
         )
         save_json(last_metrics, self.run_dir / f"metrics_iter_{self.iteration}.json")
         return last_metrics
+
+    def _track_val(self, metrics: dict[str, Any], score_name: str, score: float) -> None:
+        if self.tracker is None:
+            return
+        payload = to_tracking_metrics(metrics, "val")
+        payload["val"]["select_score"] = score
+        payload["val"]["best_select_score"] = self.best_score
+        self.tracker.log_metrics(payload, step=self.iteration)
+        self.tracker.set_tags({"select_metric": score_name})
 
     def _append_history(self, metrics: dict[str, Any]) -> None:
         row = [

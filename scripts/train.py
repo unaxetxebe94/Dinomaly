@@ -16,8 +16,9 @@ import torch
 
 from dinomaly.data import TileDataset, make_loader, sample_eval_tiles, split_frames
 from dinomaly.engine import Trainer, load_checkpoint
-from dinomaly.metrics import EvalConfig, evaluate_loader, format_metrics
+from dinomaly.metrics import EvalConfig, evaluate_loader, format_metrics, to_tracking_metrics
 from dinomaly.model import build_model
+from dinomaly.tracking import Tracker, read_run_file
 from dinomaly.utils import (
     apply_overrides,
     load_config,
@@ -36,12 +37,52 @@ def class_mapping(tiles_dir: Path) -> dict[int, str]:
     return {int(e["mask_value"]): str(e["name"]) for e in entries}
 
 
+def tile_stats(manifest: pd.DataFrame, classes: dict[int, str]) -> dict:
+    """Tile/image counts per split and per class (from manifest.parquet)."""
+    stats: dict = {"splits": {}, "classes": {}}
+    image_defect = manifest.groupby("image_uid")["has_defect"].any()
+    for split, frame in manifest.groupby("split"):
+        uids = frame["image_uid"].unique()
+        defect_images = int(image_defect.loc[uids].sum())
+        stats["splits"][str(split)] = {
+            "tiles": int(len(frame)),
+            "defect_tiles": int(frame["has_defect"].sum()),
+            "normal_tiles": int((~frame["has_defect"]).sum()),
+            "images": int(len(uids)),
+            "defect_images": defect_images,
+            "normal_images": int(len(uids) - defect_images),
+        }
+    if "categories" in manifest.columns:
+        exploded = manifest[["split", "image_uid", "categories"]].explode("categories").dropna()
+        for (split, cat), frame in exploded.groupby(["split", "categories"]):
+            name = classes.get(int(cat), f"class_{int(cat)}")
+            stats["classes"].setdefault(name, {})[str(split)] = {
+                "tiles": int(len(frame)),
+                "images": int(frame["image_uid"].nunique()),
+            }
+    return stats
+
+
+def _log_end_artifacts(tracker: Tracker, run_dir: Path, tiles_dir: Path) -> None:
+    for name in ("config.json", "history.csv", "train.log", "val_metrics.json", "test_metrics.json"):
+        tracker.log_artifact(run_dir / name)
+    for path in sorted(run_dir.glob("metrics_iter_*.json")):
+        tracker.log_artifact(path, "metrics")
+    for name in ("classes.json", "build_info.json"):
+        tracker.log_artifact(tiles_dir / name, "data")
+    errors = run_dir / "test_errors"
+    for name in ("false_positives.jpg", "false_negatives.jpg", "errors.json"):
+        path = errors / name
+        if path.exists() and path.stat().st_size < 50 * 2**20:
+            tracker.log_artifact(path, "test_errors")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--tiles-dir", default=None)
     parser.add_argument("--run-dir", default=None)
-    parser.add_argument("--resume", default=None, help="Checkpoint to resume from (e.g. runs/top/last.pt)")
+    parser.add_argument("--resume", default=None, help="Checkpoint to resume from (e.g. runs/top-bottom/last.pt)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--eval-test", action="store_true", help="Evaluate best.pt on the test split after training")
@@ -56,6 +97,29 @@ def main() -> None:
     logger = setup_logging(run_dir / "train.log")
     save_json(config, run_dir / "config.json")
 
+    project = str(config.get("project", {}).get("name", "dinomaly"))
+    tracker = Tracker().start(
+        config,
+        args.config,
+        run_name=f"{project}-{time.strftime('%Y%m%d-%H%M%S')}",
+        stage="training",
+        tiles_dir=tiles_dir,
+        # --resume continues the MLflow run recorded in this run dir.
+        resume_run_id=read_run_file(run_dir) if args.resume else None,
+    )
+    tracker.save_run_file(run_dir)
+    try:
+        train(args, config, tiles_dir, run_dir, logger, tracker)
+    except BaseException:
+        logger.exception("Training failed")
+        tracker.log_artifact(run_dir / "train.log")
+        tracker.end("FAILED" if not isinstance(sys.exc_info()[1], KeyboardInterrupt) else "KILLED")
+        raise
+    _log_end_artifacts(tracker, run_dir, tiles_dir)
+    tracker.end("FINISHED")
+
+
+def train(args, config, tiles_dir: Path, run_dir: Path, logger, tracker: Tracker) -> None:
     seed = int(config.get("project", {}).get("seed", 42))
     seed_everything(seed)
     device = resolve_device(args.device)
@@ -72,6 +136,25 @@ def main() -> None:
         )
     if frames["train"].empty:
         raise SystemExit("The train split is empty")
+    classes = class_mapping(tiles_dir)
+    stats = tile_stats(manifest, classes)
+    tracker.log_params(config)
+    tracker.log_params(
+        {"data_stats": {split: values for split, values in stats["splits"].items()}}
+    )
+    tracker.log_params(
+        {
+            "run_dir": str(run_dir.resolve()),
+            "checkpoint_best": str((run_dir / "best.pt").resolve()),
+            "checkpoint_last": str((run_dir / "last.pt").resolve()),
+            "eval_test": args.eval_test,
+            "test_max_tiles": args.test_max_tiles,
+            "num_classes": len(classes),
+        }
+    )
+    tracker.log_dict(stats, "data/tile_stats.json")
+    if args.resume:
+        tracker.set_tags({"last_resume_from": str(args.resume)})
 
     train_df = frames["train"]
     train_df = train_df[~train_df["has_defect"]]
@@ -113,8 +196,9 @@ def main() -> None:
         device=device,
         config=config,
         run_dir=run_dir,
-        classes=class_mapping(tiles_dir),
+        classes=classes,
         logger=logger,
+        tracker=tracker,
     )
     if args.resume:
         trainer.resume(args.resume)
@@ -143,9 +227,12 @@ def main() -> None:
             model,
             test_loader,
             device,
-            classes=class_mapping(tiles_dir),
+            classes=classes,
             cfg=eval_cfg,
             pixel_threshold=checkpoint.get("pixel_threshold"),
+            # Operating points chosen on validation, never re-tuned on test.
+            tile_threshold=checkpoint.get("tile_threshold"),
+            image_threshold=checkpoint.get("image_threshold"),
             amp=bool(train_cfg.get("amp", True)),
             gaussian_sigma=float(train_cfg.get("gaussian_sigma", 4.0)),
             error_dir=run_dir / "test_errors" if error_tiles > 0 else None,
@@ -154,8 +241,13 @@ def main() -> None:
         test_metrics["elapsed_seconds"] = round(time.time() - started, 1)
         test_metrics["checkpoint"] = str(run_dir / "best.pt")
         test_metrics["pixel_threshold"] = checkpoint.get("pixel_threshold")
+        test_metrics["checkpoint_iteration"] = checkpoint.get("iteration")
         save_json(test_metrics, run_dir / "test_metrics.json")
         logger.info(f"Test: {format_metrics(test_metrics)}")
+        tracker.log_metrics(
+            to_tracking_metrics(test_metrics, "test"), step=int(checkpoint.get("iteration") or 0)
+        )
+        tracker.log_params({"best_iteration": checkpoint.get("iteration")})
         errors = test_metrics.get("errors")
         if errors and errors.get("dir"):
             logger.info(

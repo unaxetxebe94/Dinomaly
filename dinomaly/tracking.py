@@ -22,6 +22,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import urllib.request
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -54,13 +55,13 @@ def _health_ok(uri: str, timeout: float = 3.0) -> bool:
         return False
 
 
-def local_store_uri(repo_root: Path = REPO_ROOT) -> str:
-    path = (repo_root / "mlruns").resolve()
+def local_store_uri(repo_root: Path | None = None) -> str:
+    path = ((repo_root or REPO_ROOT) / "mlruns").resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path.as_uri()
 
 
-def resolve_tracking_uri(repo_root: Path = REPO_ROOT) -> str:
+def resolve_tracking_uri(repo_root: Path | None = None) -> str:
     """Return a usable tracking URI, falling back to ``<repo>/mlruns``."""
     global _last_fallback
     uri = os.environ.get("MLFLOW_TRACKING_URI") or DEFAULT_TRACKING_URI
@@ -205,6 +206,17 @@ def log_metrics_dict(d: Mapping[str, Any], step: int | None = None) -> int:
     return len(metrics)
 
 
+def _safe_console() -> None:
+    """MLflow prints emoji (e.g. 'View run ...'); a cp1252 console would raise."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+            if encoding != "utf8" and hasattr(stream, "reconfigure"):
+                stream.reconfigure(errors="backslashreplace")
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class Tracker:
     """Thin, failure-tolerant wrapper around one MLflow run."""
 
@@ -233,6 +245,7 @@ class Tracker:
             log.info("MLflow tracking disabled (tracking.enabled=false)")
             return self
         try:
+            _safe_console()
             mlflow = _mlflow()
             self.tracking_uri = resolve_tracking_uri()
             mlflow.set_tracking_uri(self.tracking_uri)
@@ -254,6 +267,13 @@ class Tracker:
             self.run_id = run.info.run_id
             self.enabled = True
             tags = standard_tags(config, config_path, stage, tiles_dir)
+            if self.resumed:
+                # Keep the tags of the original run; record what touched it last.
+                tags = {
+                    "last_stage": stage,
+                    "last_git_commit": tags["git_commit"],
+                    "last_git_dirty": tags["git_dirty"],
+                }
             tags.update(extra_tags or {})
             mlflow.set_tags(tags)
             log.info(
@@ -331,7 +351,19 @@ class Tracker:
     def end(self, status: str = "FINISHED") -> None:
         if not self.active:
             return
-        self._call("end run", lambda: _mlflow().end_run(status=status))
+        try:
+            _mlflow().end_run(status=status)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"MLflow: end_run failed ({exc}); marking run {self.run_id} {status} directly")
+            try:
+                _mlflow().tracking.MlflowClient().set_terminated(self.run_id, status=status)
+            except Exception as exc2:  # noqa: BLE001
+                log.warning(f"MLflow: could not terminate run ({exc2})")
+            try:
+                while _mlflow().active_run() is not None:
+                    _mlflow().end_run(status=status)
+            except Exception:  # noqa: BLE001
+                pass
         self.enabled = False
 
 

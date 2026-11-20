@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -16,8 +17,9 @@ import torch
 
 from dinomaly.data import TileDataset, make_loader, sample_eval_tiles, split_frames
 from dinomaly.engine import load_checkpoint
-from dinomaly.metrics import EvalConfig, evaluate_loader, format_metrics
+from dinomaly.metrics import EvalConfig, evaluate_loader, format_metrics, to_tracking_metrics
 from dinomaly.model import build_model
+from dinomaly.tracking import Tracker, read_run_file
 from dinomaly.utils import (
     apply_overrides,
     load_config,
@@ -50,6 +52,9 @@ def main() -> None:
         help="Where to write error tiles/mosaics (default: <checkpoint dir>/<split>_errors)",
     )
     parser.add_argument("--out", default=None)
+    parser.add_argument(
+        "--no-mlflow", action="store_true", help="Do not log the evaluation to MLflow"
+    )
     parser.add_argument("--set", action="append", default=[])
     args = parser.parse_args()
 
@@ -120,6 +125,8 @@ def main() -> None:
             classes=classes,
             cfg=eval_cfg,
             pixel_threshold=threshold,
+            tile_threshold=checkpoint.get("tile_threshold"),
+            image_threshold=checkpoint.get("image_threshold"),
             amp=bool(train_cfg.get("amp", True)),
             gaussian_sigma=float(train_cfg.get("gaussian_sigma", 4.0)),
             error_dir=errors_dir,
@@ -151,6 +158,44 @@ def main() -> None:
     payload = all_results if len(all_results) > 1 else next(iter(all_results.values()))
     save_json(payload, out)
     logger.info(f"Saved metrics to {out}")
+    if not args.no_mlflow:
+        log_to_mlflow(args, config, tiles_dir, checkpoint, all_results, out)
+
+
+def log_to_mlflow(args, config, tiles_dir: Path, checkpoint: dict, results: dict, out: Path) -> None:
+    """Log into the training run of this checkpoint if known, else a new run."""
+    ckpt_dir = Path(args.checkpoint).parent
+    run_id = read_run_file(ckpt_dir)
+    project = str(config.get("project", {}).get("name", "dinomaly"))
+    tracker = Tracker().start(
+        config,
+        args.config,
+        run_name=f"{project}-eval-{time.strftime('%Y%m%d-%H%M%S')}",
+        stage="evaluation",
+        tiles_dir=tiles_dir,
+        resume_run_id=run_id,
+    )
+    if not tracker.active:
+        return
+    try:
+        if not tracker.resumed:
+            tracker.log_params(config)
+            tracker.log_params({"checkpoint": str(Path(args.checkpoint).resolve())})
+        tracker.set_tags(
+            {
+                "last_evaluation": f"{args.split} max_tiles={args.max_tiles} ckpt={Path(args.checkpoint).name}",
+            }
+        )
+        step = int(checkpoint.get("iteration") or 0)
+        for split, result in results.items():
+            tracker.log_metrics(to_tracking_metrics(result, split), step=step)
+            errors_dir = (result.get("errors") or {}).get("dir")
+            if errors_dir:
+                for name in ("false_positives.jpg", "false_negatives.jpg", "errors.json"):
+                    tracker.log_artifact(Path(errors_dir) / name, f"evaluation/{split}_errors")
+        tracker.log_artifact(out, "evaluation")
+    finally:
+        tracker.end("FINISHED")
 
 
 if __name__ == "__main__":
