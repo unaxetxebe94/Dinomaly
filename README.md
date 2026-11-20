@@ -1,4 +1,4 @@
-# Dinomaly sobre imágenes grandes troceadas (Top / COCO)
+# Dinomaly sobre imágenes grandes troceadas (Top-Bottom / Left-Right, COCO)
 
 Pipeline de detección no supervisada de anomalías con
 [Dinomaly (CVPR 2025)](https://github.com/guojiajeremy/Dinomaly) adaptado a los
@@ -35,12 +35,15 @@ imágenes gigantes + _annotations.coco.json
 
 ## 2. Configuración
 
-Todo se controla desde [`configs/top.yaml`](configs/top.yaml). Lo importante:
+Hay un config por grupo de caras: [`configs/top-bottom.yaml`](configs/top-bottom.yaml)
+(fuentes `Top` + `Bottom`) y [`configs/left-right.yaml`](configs/left-right.yaml)
+(`Left` + `Right`). Los ejemplos usan `top-bottom`; cambia el config para
+entrenar el otro grupo. Lo importante:
 
 | Clave | Valor por defecto | Significado |
 |---|---|---|
-| `data.sources` | carpeta `Top` | Lista de `{name, root, annotations}`. Acepta varias carpetas. |
-| `data.tiles_dir` | `data/tiles_top` | Salida de tiles, máscaras y manifest. |
+| `data.sources` | carpetas `Top` + `Bottom` | Lista de `{name, root, annotations}`. Acepta varias carpetas. |
+| `data.tiles_dir` | `data/tiles_top-bottom` | Salida de tiles, máscaras y manifest. |
 | `data.tile_size` / `tile_overlap` | `1024` / `128` | Stride = 896 px (12.5 % solape). |
 | `data.min_std` | `3.0` | Descarta tiles de fondo casi uniforme (los que tienen defecto nunca se descartan). |
 | `data.roi.enabled` | `true` | Solo genera tiles alrededor del objeto detectado (ver abajo). |
@@ -53,11 +56,10 @@ Todo se controla desde [`configs/top.yaml`](configs/top.yaml). Lo importante:
 | `model.name` | `dinov2reg_vit_base_14` | `small` / `base` / `large`, con o sin registros. |
 | `train.total_iters` | `10000` | Iteraciones (no epochs). |
 | `train.batch_size` | `16` | ~5.7 GB de VRAM con ViT-B/392 y AMP. |
-| `train.checkpoint_dir` | `runs/top` | `best.pt`, `last.pt`, `history.csv`, `test_metrics.json`. |
+| `train.checkpoint_dir` | `runs/top-bottom` | `best.pt`, `last.pt`, `history.csv`, `test_metrics.json`. |
 
-> **Nota sobre las rutas**: en la petición aparecía dos veces la misma carpeta
-> `Top`. El config usa una sola fuente; para añadir otra (p. ej. `Front`)
-> basta con añadir otra entrada a `data.sources`. Las imágenes con el mismo
+> **Nota sobre las rutas**: cada config combina dos fuentes (dos caras); para
+> añadir otra basta con añadir otra entrada a `data.sources`. Las imágenes con el mismo
 > `image_id` en fuentes distintas no colisionan (`image_uid = source:id`).
 >
 > El reparto train/val/test se calcula sobre el conjunto completo de imágenes
@@ -70,7 +72,7 @@ Todo se controla desde [`configs/top.yaml`](configs/top.yaml). Lo importante:
 ## 3. Crear los tiles
 
 ```bash
-uv run python scripts/build_tiles.py --config configs/top.yaml --workers 6
+uv run python scripts/build_tiles.py --config configs/top-bottom.yaml --workers 6
 ```
 
 - Lee los TIFF con `libvips` (solo decodifica las ventanas necesarias).
@@ -80,7 +82,7 @@ uv run python scripts/build_tiles.py --config configs/top.yaml --workers 6
   completar solo las imágenes que faltan sin repetir las ya hechas.
 - Genera `tiles/<split>/<tile_id>.jpg` y `masks/<split>/<tile_id>.png`.
   En la máscara cada píxel vale el índice compacto de la clase (0 = fondo);
-  [`classes.json`](data/tiles_top/classes.json) mapea índice → nombre.
+  [`classes.json`](data/tiles_top-bottom/classes.json) mapea índice → nombre.
 - Escribe `manifest.parquet` (una fila por tile: ruta, split, coordenadas,
   `has_defect`, píxeles de defecto, categorías) y `build_info.json`.
 - Los tiles que contienen **cualquier** píxel anotado se marcan como
@@ -108,7 +110,7 @@ en `build_info.json`.
 Antes de lanzar horas de troceado, comprueba el recorte en una muestra:
 
 ```bash
-uv run python scripts/inspect_roi.py --config configs/top.yaml --limit 10
+uv run python scripts/inspect_roi.py --config configs/top-bottom.yaml --limit 10
 ```
 
 Escribe en `roi_preview/` un JPG por imagen con la caja dibujada, la máscara
@@ -120,7 +122,7 @@ roi_x1/roi_y1` por tile, y `build_info.json` la cobertura media.
 Si un run anterior quedó incompleto:
 
 ```bash
-uv run python scripts/build_tiles.py --config configs/top.yaml --workers 6 --resume
+uv run python scripts/build_tiles.py --config configs/top-bottom.yaml --workers 6 --resume
 ```
 
 También puedes forzar la reconstrucción completa con `--overwrite` (borra
@@ -129,7 +131,7 @@ También puedes forzar la reconstrucción completa con `--overwrite` (borra
 Prueba rápida con 4 imágenes (sin llenar el disco):
 
 ```bash
-uv run python scripts/build_tiles.py --config configs/top.yaml \
+uv run python scripts/build_tiles.py --config configs/top-bottom.yaml \
     --tiles-dir data/tiles_debug --limit-images 4 --workers 4 --overwrite
 ```
 
@@ -152,7 +154,7 @@ corrupto conocido es `1377_26944_top_native.tiff`.
 ## 4. Entrenar
 
 ```bash
-uv run python scripts/train.py --config configs/top.yaml
+uv run python scripts/train.py --config configs/top-bottom.yaml
 ```
 
 - Entrena **solo con tiles normales** del split `train` (Dinomaly es
@@ -172,12 +174,12 @@ uv run python scripts/train.py --config configs/top.yaml
   `train.amp: true` usa bfloat16 y es ~2.5× más rápido, pero en una ejecución
   larga puede desestabilizarse; el guard de NaN evita que eso arruine el run.
 - Al terminar, si añades `--eval-test`, evalúa `best.pt` en el split de test y
-  escribe `runs/top/test_metrics.json`.
+  escribe `runs/top-bottom/test_metrics.json`.
 
 Reanudar:
 
 ```bash
-uv run python scripts/train.py --config configs/top.yaml --resume runs/top/last.pt
+uv run python scripts/train.py --config configs/top-bottom.yaml --resume runs/top-bottom/last.pt
 ```
 
 Para un run largo es más cómodo el lanzador con auto-reanudación: si el
@@ -185,13 +187,13 @@ proceso muere, vuelve a arrancar desde `last.pt` (hasta 5 intentos) y lanza
 la evaluación de test al terminar.
 
 ```bash
-./scripts/train_resilient.sh configs/top.yaml
+./scripts/train_resilient.sh configs/top-bottom.yaml
 ```
 
 Prueba de humo (20 iteraciones):
 
 ```bash
-uv run python scripts/train.py --config configs/top.yaml \
+uv run python scripts/train.py --config configs/top-bottom.yaml \
     --tiles-dir data/tiles_debug --run-dir runs/debug \
     --set train.total_iters=20 --set train.eval_every=10 --set train.max_eval_tiles=300
 ```
@@ -202,7 +204,7 @@ con `--set train.amp=true` sube a ~3–3.5 it/s (≈50 min).
 ### Salidas
 
 ```
-runs/top/
+runs/top-bottom/
 ├── best.pt              # bottleneck + decoder + umbrales de val
 ├── last.pt              # último checkpoint (reanudable)
 ├── history.csv
@@ -220,8 +222,8 @@ validación (mejor F1) para aplicarlos al test sin reajustar.
 ## 5. Evaluar
 
 ```bash
-uv run python scripts/evaluate.py --config configs/top.yaml \
-    --checkpoint runs/top/best.pt --split test --max-tiles 8000
+uv run python scripts/evaluate.py --config configs/top-bottom.yaml \
+    --checkpoint runs/top-bottom/best.pt --split test --max-tiles 8000
 ```
 
 `--max-tiles 0` evalúa todos los tiles (lento). El script imprime y guarda
@@ -231,7 +233,7 @@ uv run python scripts/evaluate.py --config configs/top.yaml \
 
 Por defecto se guardan los **50 falsos positivos y 50 falsos negativos** más
 severos de cada split evaluado, con su heatmap, en
-`runs/top/<split>_errors/`:
+`runs/top-bottom/<split>_errors/`:
 
 | Archivo | Contenido |
 |---|---|
@@ -251,16 +253,16 @@ Ajustes:
 
 ```bash
 # más casos, y en otra carpeta
-uv run python scripts/evaluate.py --config configs/top.yaml \
-    --checkpoint runs/top/best.pt --split test --error-tiles 150 \
-    --errors-dir runs/top/mis_errores
+uv run python scripts/evaluate.py --config configs/top-bottom.yaml \
+    --checkpoint runs/top-bottom/best.pt --split test --error-tiles 150 \
+    --errors-dir runs/top-bottom/mis_errores
 
 # desactivar
 uv run python scripts/evaluate.py ... --error-tiles 0
 ```
 
 El entrenamiento con `--eval-test` los genera automáticamente en
-`runs/top/test_errors/` (tamaño controlado por `train.save_error_tiles`).
+`runs/top-bottom/test_errors/` (tamaño controlado por `train.save_error_tiles`).
 
 ### Métricas
 
@@ -290,8 +292,8 @@ Detalles de implementación:
 ## 6. Predecir una imagen nueva
 
 ```bash
-uv run python scripts/predict.py --config configs/top.yaml \
-    --checkpoint runs/top/best.pt \
+uv run python scripts/predict.py --config configs/top-bottom.yaml \
+    --checkpoint runs/top-bottom/best.pt \
     --image "/run/media/.../Top/1008_111213_top_native.tiff" \
     --out-dir predictions/1008_111213 --downsample 8
 ```
@@ -335,7 +337,7 @@ scripts/
 | `unable to call jpegsave` y `tiffload: load error` al trocear | Varios hilos decodificando TIFF gigantes en el mismo proceso. Ya está resuelto usando procesos; vuelve a lanzar con `--resume` para completar las imágenes que fallaron. |
 | `loss=nan` | Inestabilidad numérica (típica con bf16). El entrenamiento descarta ese step y sigue; revisa `skipped=` en el log. Si se repite mucho, usa `train.amp: false`. |
 | `I-AUROC= n/a` | El subconjunto de validación no contiene imágenes normales. Usa el split completo o selecciona `tile.auroc` como métrica. |
-| El proceso se corta a mitad de entrenamiento | `last.pt` se guarda cada `train.save_every` iteraciones. Reanuda con `--resume runs/top/last.pt` o usa `./scripts/train_resilient.sh`. |
+| El proceso se corta a mitad de entrenamiento | `last.pt` se guarda cada `train.save_every` iteraciones. Reanuda con `--resume runs/top-bottom/last.pt` o usa `./scripts/train_resilient.sh`. |
 | El proceso termina sin traza (`EXIT=120`) | Suele ser falta de espacio/RAM: `/tmp` es tmpfs (cuenta como RAM) y los logs o checkpoints ahí compiten con el entrenamiento. Guarda runs y logs en el proyecto, no en `/tmp`. |
 | Cambio de anotaciones o de fuentes | Los splits se recalculan; reconstruye los tiles con `--overwrite` (no uses `--resume`). |
 | `--resume` avisa de "different tiling settings" | El manifiesto se construyó con otro `tile_size`, anotaciones o `data.roi`. Usa `--overwrite` o un `--tiles-dir` nuevo. |

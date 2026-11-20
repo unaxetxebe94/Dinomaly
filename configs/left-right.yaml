@@ -1,4 +1,4 @@
-# Dinomaly on the "Top" COCO dataset.
+# Dinomaly on the "Left" + "Right" COCO datasets (face group left-right).
 #
 # Add more annotated folders under data.sources to train/evaluate a single
 # multi-source model; splits are grouped by source image so tiles from the

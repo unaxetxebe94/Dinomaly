@@ -9,7 +9,7 @@
 # train.total_iters.
 set -uo pipefail
 
-CONFIG="${1:-configs/top.yaml}"
+CONFIG="${1:-configs/top-bottom.yaml}"
 ATTEMPTS="${2:-5}"
 
 RUN_DIR=$(uv run python - "$CONFIG" <<'PY'

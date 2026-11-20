@@ -3,7 +3,7 @@
 #   ./scripts/run_pipeline.sh [config] [workers]
 set -euo pipefail
 
-CONFIG="${1:-configs/top.yaml}"
+CONFIG="${1:-configs/top-bottom.yaml}"
 WORKERS="${2:-6}"
 
 read -r TILES_DIR RUN_DIR < <(uv run python - "$CONFIG" <<'PY'

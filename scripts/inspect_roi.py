@@ -6,7 +6,7 @@ largest connected bright zone and draws its bounding box.  Tiling only
 produces tiles inside that box.
 
 Example:
-    uv run python scripts/inspect_roi.py --config configs/top.yaml --limit 10
+    uv run python scripts/inspect_roi.py --config configs/top-bottom.yaml --limit 10
 """
 
 from __future__ import annotations

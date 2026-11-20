@@ -3,8 +3,8 @@
 
 Example:
     uv run python scripts/predict.py \
-        --config configs/top.yaml \
-        --checkpoint runs/top/best.pt \
+        --config configs/top-bottom.yaml \
+        --checkpoint runs/top-bottom/best.pt \
         --image "/run/media/.../Top/1008_111213_top_native.tiff" \
         --out-dir predictions/1008_111213
 """
