@@ -7,3 +7,4 @@ predictions/
 .pytest_cache/
 .ruff_cache/
 roi_preview/
+mlruns/
