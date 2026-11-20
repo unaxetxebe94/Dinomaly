@@ -33,6 +33,12 @@ imágenes gigantes + _annotations.coco.json
   uv run python -c "import torch; print(torch.cuda.is_available())"
   ```
 
+- En **Windows** no hace falta instalar libvips: la dependencia
+  `pyvips[binary]` trae la DLL. `torch` se instala desde el índice
+  `pytorch-cu128` (definido en `pyproject.toml`).
+- Las rutas COCO (`<id>_<cara>_native.jpg`) se resuelven contra los ficheros
+  reales del disco (`<seq>_<id>_<cara>_native.tiff`) por el `<id>_<cara>`.
+
 ## 2. Configuración
 
 Hay un config por grupo de caras: [`configs/top-bottom.yaml`](configs/top-bottom.yaml)
@@ -51,12 +57,15 @@ entrenar el otro grupo. Lo importante:
 | `data.roi.select` | `area` | Qué zona conectada se queda: `area`, `width` o `height`. |
 | `data.roi.margin` | `0` | Píxeles extra alrededor de la caja. |
 | `data.roi.preview` | `1024` | Resolución de trabajo del detector (no afecta a los tiles). |
+| `data.max_images` | `null` | Solo para smoke tests: máximo de imágenes por split y por fuente (alternando con/sin defecto). |
 | `data.split` | 70/15/15 | Split **por imagen original**, estratificado por presencia de defecto. |
 | `data.crop_size` | `392` | Entrada del ViT (392 / 14 = 28×28 tokens). |
 | `model.name` | `dinov2reg_vit_base_14` | `small` / `base` / `large`, con o sin registros. |
 | `train.total_iters` | `10000` | Iteraciones (no epochs). |
 | `train.batch_size` | `16` | ~5.7 GB de VRAM con ViT-B/392 y AMP. |
 | `train.checkpoint_dir` | `runs/top-bottom` | `best.pt`, `last.pt`, `history.csv`, `test_metrics.json`. |
+| `tracking.experiment` | `dinomaly/<grupo>` | Experimento MLflow (opcional; por defecto se deriva de `project.name`). |
+| `tracking.enabled` | `true` | `false` desactiva MLflow. |
 
 > **Nota sobre las rutas**: cada config combina dos fuentes (dos caras); para
 > añadir otra basta con añadir otra entrada a `data.sources`. Las imágenes con el mismo
@@ -213,11 +222,13 @@ runs/top-bottom/
 ├── config.json
 ├── val_metrics.json
 ├── test_metrics.json    # si se usa --eval-test
+├── mlflow_run.json      # id del run MLflow (para reanudar el mismo run)
 └── metrics_iter_N.json
 ```
 
-Los checkpoints guardan `pixel_threshold` e `image_threshold` calculados en
-validación (mejor F1) para aplicarlos al test sin reajustar.
+Los checkpoints guardan `pixel_threshold`, `tile_threshold` e
+`image_threshold` calculados en validación (mejor F1) para aplicarlos al test
+sin reajustar.
 
 ## 5. Evaluar
 
@@ -227,7 +238,10 @@ uv run python scripts/evaluate.py --config configs/top-bottom.yaml \
 ```
 
 `--max-tiles 0` evalúa todos los tiles (lento). El script imprime y guarda
-`eval_metrics.json` junto al checkpoint.
+`eval_metrics.json` junto al checkpoint. Si junto al checkpoint hay un
+`mlflow_run.json`, las métricas `{split}/...` se registran en ese mismo run
+(sobrescriben el valor del mismo step); si no, se crea un run nuevo con
+`stage=evaluation`. `--no-mlflow` lo desactiva.
 
 ### Inspeccionar los errores del test
 
@@ -274,9 +288,19 @@ Se calculan a tres niveles, todas usando las máscaras de polígono rasterizadas
 | **Tile** | detección local | Score del tile = media del 1 % de píxeles más anómalos; etiqueta = ¿tiene algún píxel de defecto? |
 | **Imagen** | detección global | Score de la imagen = máximo (o top-k) de sus tiles; etiqueta = ¿tiene algún defecto? |
 
-También hay desglose **por categoría** de AUROC/AP de píxel y AP de tile
-(p. ej. `Damaged face`, `Slip skin`, `Broken lipping`, …). El AP de píxel por
-categoría usa como negativos todos los píxeles de fondo.
+A nivel de tile e imagen se reportan AUROC, AP y, a un **umbral operativo**,
+precision, recall, F1, accuracy y TP/FP/FN/TN. En validación el umbral es el
+de mejor F1 en validación; en test se usa el umbral de validación guardado en
+el checkpoint (el F1 oráculo del test se guarda como `f1_best`).
+
+También hay desglose **por categoría** (p. ej. `Damaged face`, `Slip skin`,
+`Broken lipping`, …):
+
+- Píxel: AUROC/AP/F1; los negativos son todos los píxeles de fondo.
+- Tile e imagen: positivos = tiles/imágenes con al menos una instancia de la
+  clase; negativos = tiles/imágenes **normales** (sin ningún defecto). Las que
+  solo contienen otras clases se excluyen. Se aplica el mismo umbral global, así
+  que el recall por clase indica qué defectos se escapan al punto de operación.
 
 Detalles de implementación:
 
@@ -286,8 +310,53 @@ Detalles de implementación:
 - PRO se calcula sobre hasta `train.pro_max_tiles` tiles defectuosos,
   reescalados a `pro_size` (128). Es una aproximación por tile, no sobre la
   imagen completa de 16k×27k.
-- El F1 de test usa el umbral elegido en validación (`f1_at_threshold`), además
-  del F1 oráculo (`f1`).
+- Píxel: el F1 de test al umbral de validación es `f1_at_threshold`; `f1` es
+  el F1 oráculo.
+
+### Seguimiento con MLflow
+
+Cada `train.py` crea **un run** MLflow (`<project.name>-<timestamp>`):
+
+- **Servidor**: `MLFLOW_TRACKING_URI` o, si no está definida,
+  `http://127.0.0.1:5001`. Si `/health` no responde en ~3 s se usa el
+  almacén local `./mlruns` (tag `tracking_fallback=true`) y el
+  entrenamiento sigue. Un fallo de MLflow nunca aborta el entrenamiento.
+- **Experimento**: `dinomaly/<grupo>`, donde el grupo es `project.name` sin
+  el sufijo `-dinomaly` (`dinomaly/top-bottom`, `dinomaly/left-right`).
+  Se puede sobrescribir con `tracking.experiment`.
+- **Tags**: `model_family`, `face_group`, `config_path`, `git_commit`,
+  `git_branch`, `git_dirty`, `dataset`, `tracking_fallback`, `stage`.
+- **Params**: config aplanado, rutas de run/checkpoints, `best_iteration`
+  y estadísticas de tiles (también como artefacto `data/tile_stats.json`).
+  Los checkpoints no se suben.
+- **Métricas**: `train/loss`, `train/lr`, … cada `log_every`;
+  `val/...` en cada evaluación (step = iteración); `test/...` con
+  `--eval-test` (step = iteración del mejor checkpoint). Esquema:
+  `{split}/{tile|image|pixel}/{métrica}` y
+  `{split}/{nivel}/class/{clase}/{métrica}` con
+  `auroc, ap, precision, recall, f1, accuracy, tp, fp, fn, tn, threshold`
+  (más `f1_best`, `positives`, `negatives`); píxel añade `aupro`.
+- **Artefactos**: `config.json`, `history.csv`, `train.log`, métricas JSON,
+  `data/classes.json`, `data/build_info.json` y mosaicos de errores.
+- **Reanudar**: `mlflow_run.json` guarda el id del run; con `--resume` se
+  continúa el mismo run. Si el entrenamiento falla, el run queda `FAILED`.
+
+Ejemplo con otro servidor:
+
+```bash
+MLFLOW_TRACKING_URI=http://mi-servidor:5000 uv run python scripts/train.py --config configs/top-bottom.yaml --eval-test
+```
+
+### Tests y smoke test
+
+```bash
+uv run pytest
+```
+
+Para una prueba de extremo a extremo, copia el config con `data.max_images: 2`,
+otro `tiles_dir`/`checkpoint_dir`, `train.total_iters: 20`,
+`train.eval_every: 10`, `train.batch_size: 2` y
+`tracking.experiment: dinomaly/smoke-test`.
 
 ## 6. Predecir una imagen nueva
 
@@ -321,7 +390,9 @@ dinomaly/
 ├── losses.py     # cosine loss con hard mining
 ├── metrics.py    # AUROC/AP/F1/PRO por píxel, tile e imagen
 ├── engine.py     # ciclo de entrenamiento, scheduler, checkpoints
+├── tracking.py   # contrato MLflow común (URI, experimento, tags, métricas)
 └── utils.py
+tests/            # pytest: métricas y tracking
 scripts/
 ├── build_tiles.py
 ├── inspect_roi.py
