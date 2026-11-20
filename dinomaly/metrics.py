@@ -125,6 +125,106 @@ def _safe_ap(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(average_precision_score(y_true, y_score))
 
 
+def binary_report(
+    y_true: np.ndarray, y_score: np.ndarray, threshold: float | None = None
+) -> dict[str, float]:
+    """Ranking metrics plus confusion counts at an operating threshold.
+
+    A sample is predicted anomalous when ``score >= threshold`` (the same
+    convention as ``precision_recall_curve``).  Without an explicit threshold
+    the best-F1 threshold of these very scores is used (validation); on test
+    pass the threshold selected on validation.
+    """
+    y_true, y_score = _finite(
+        np.asarray(y_true, dtype=np.int64), np.asarray(y_score, dtype=np.float64)
+    )
+    f1_best, best_threshold = _score_f1(y_true, y_score)
+    out: dict[str, float] = {
+        "auroc": _safe_auc(y_true, y_score),
+        "ap": _safe_ap(y_true, y_score),
+        "f1_best": f1_best,
+        "best_threshold": best_threshold,
+        "positives": int(y_true.sum()),
+        "negatives": int(len(y_true) - y_true.sum()),
+    }
+    thr = threshold if threshold is not None and math.isfinite(float(threshold)) else best_threshold
+    out["threshold"] = float(thr)
+    nan = float("nan")
+    if not math.isfinite(float(thr)) or len(y_true) == 0:
+        out.update(precision=nan, recall=nan, f1=nan, accuracy=nan, tp=nan, fp=nan, fn=nan, tn=nan)
+        return out
+    pred = y_score >= float(thr)
+    positive = y_true > 0
+    tp = int(np.sum(pred & positive))
+    fp = int(np.sum(pred & ~positive))
+    fn = int(np.sum(~pred & positive))
+    tn = int(np.sum(~pred & ~positive))
+    out.update(
+        tp=tp,
+        fp=fp,
+        fn=fn,
+        tn=tn,
+        precision=tp / (tp + fp) if tp + fp > 0 else 0.0,
+        recall=tp / (tp + fn) if tp + fn > 0 else nan,
+        f1=2 * tp / (2 * tp + fp + fn) if tp + fp + fn > 0 else nan,
+        accuracy=(tp + tn) / len(y_true),
+    )
+    return out
+
+
+def per_class_reports(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    sample_categories: list[set[int]] | list[list[int]],
+    threshold: float | None,
+    name_of: Any = str,
+) -> dict[str, dict[str, float]]:
+    """One-vs-normal report per class.
+
+    Positives are samples containing class ``c``; negatives are *normal*
+    samples (no defect at all).  Samples whose defects are only of other
+    classes are excluded, so each class is judged against the same normal
+    population with the global operating ``threshold``.
+    """
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    cats = [set(row) for row in sample_categories]
+    normal = y_true == 0
+    out: dict[str, dict[str, float]] = {}
+    for cat in sorted({c for row in cats for c in row}):
+        has = np.array([cat in row for row in cats], dtype=bool)
+        if not has.any():
+            continue
+        keep = has | normal
+        out[name_of(cat)] = binary_report(has[keep].astype(np.int64), y_score[keep], threshold)
+    return out
+
+
+def aggregate_images(
+    image_records: dict[str, list[tuple[float, int]]],
+    topk: int,
+    image_categories: dict[str, set[int]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[set[int]], list[str]]:
+    """Image score = mean of its top-k tile scores; label = any defect tile."""
+    scores: list[float] = []
+    labels: list[int] = []
+    cats: list[set[int]] = []
+    uids: list[str] = []
+    k = max(1, int(topk))
+    for uid, records in image_records.items():
+        ordered = sorted(records, key=lambda r: r[0], reverse=True)
+        scores.append(float(np.mean([r[0] for r in ordered[:k]])))
+        labels.append(int(any(r[1] for r in records)))
+        cats.append(set((image_categories or {}).get(uid, set())))
+        uids.append(uid)
+    return (
+        np.asarray(scores, dtype=np.float64),
+        np.asarray(labels, dtype=np.int64),
+        cats,
+        uids,
+    )
+
+
 def compute_pro(
     masks: np.ndarray,
     amaps: np.ndarray,
@@ -285,6 +385,7 @@ class AnomalyEvaluator:
         self.tile_labels: list[int] = []
         self.tile_categories: list[list[int]] = []
         self.image_records: dict[str, list[tuple[float, int]]] = defaultdict(list)
+        self.image_categories: dict[str, set[int]] = defaultdict(set)
 
         self.pro_maps: list[np.ndarray] = []
         self.pro_masks: list[np.ndarray] = []
@@ -356,6 +457,7 @@ class AnomalyEvaluator:
             score = float(tile_scores[i])
             label = int(tile_labels[i])
             self.image_records[image_uids[i]].append((score, label))
+            self.image_categories[image_uids[i]].update(int(c) for c in categories[i])
             if label and len(self.pro_maps) < self.cfg.pro_max_tiles:
                 score_map = maps_np[i : i + 1]
                 mask = masks_np[i : i + 1].float()
@@ -507,7 +609,19 @@ class AnomalyEvaluator:
         save_json(info, out_dir / "errors.json")
         return info
 
-    def compute(self, pixel_threshold: float | None = None) -> dict[str, Any]:
+    def compute(
+        self,
+        pixel_threshold: float | None = None,
+        tile_threshold: float | None = None,
+        image_threshold: float | None = None,
+    ) -> dict[str, Any]:
+        """Metrics for everything seen so far.
+
+        ``tile_threshold``/``image_threshold`` are the operating points used for
+        precision/recall/F1/accuracy and the confusion counts; ``None`` means the
+        best-F1 threshold of this split (validation).  ``f1_best`` is always the
+        oracle F1 of the split for reference.
+        """
         result: dict[str, Any] = {
             "num_tiles": self.num_tiles,
             "num_defect_tiles": self.num_defect_tiles,
@@ -539,41 +653,22 @@ class AnomalyEvaluator:
 
         tile_scores = np.asarray(self.tile_scores, dtype=np.float64)
         tile_labels = np.asarray(self.tile_labels, dtype=np.int64)
-        tile = result["tile"]
-        tile["auroc"] = _safe_auc(tile_labels, tile_scores)
-        tile["ap"] = _safe_ap(tile_labels, tile_scores)
-        tile["f1"], tile["best_threshold"] = _score_f1(tile_labels, tile_scores)
-        if self.tile_categories:
-            tile["per_category"] = {}
-            cats = sorted({c for row in self.tile_categories for c in row})
-            for cat in cats:
-                y = np.array([cat in row for row in self.tile_categories], dtype=np.int64)
-                counts = int(y.sum())
-                if counts == 0:
-                    continue
-                tile["per_category"][self._cat_name(cat)] = {
-                    "auroc": _safe_auc(y, tile_scores),
-                    "ap": _safe_ap(y, tile_scores),
-                    "positive_tiles": counts,
-                }
+        tile = binary_report(tile_labels, tile_scores, tile_threshold)
+        result["tile"] = tile
+        tile["per_category"] = per_class_reports(
+            tile_labels, tile_scores, self.tile_categories, tile["threshold"], self._cat_name
+        )
 
-        image_scores: list[float] = []
-        image_labels: list[int] = []
-        for records in self.image_records.values():
-            records.sort(key=lambda r: r[0], reverse=True)
-            k = max(1, int(self.cfg.image_topk))
-            score = float(np.mean([r[0] for r in records[:k]]))
-            label = int(any(r[1] for r in records))
-            image_scores.append(score)
-            image_labels.append(label)
-        image_scores_arr = np.asarray(image_scores, dtype=np.float64)
-        image_labels_arr = np.asarray(image_labels, dtype=np.int64)
-        image = result["image"]
-        image["auroc"] = _safe_auc(image_labels_arr, image_scores_arr)
-        image["ap"] = _safe_ap(image_labels_arr, image_scores_arr)
-        image["f1"], image["best_threshold"] = _score_f1(image_labels_arr, image_scores_arr)
+        image_scores_arr, image_labels_arr, image_cats, _ = aggregate_images(
+            self.image_records, self.cfg.image_topk, self.image_categories
+        )
+        image = binary_report(image_labels_arr, image_scores_arr, image_threshold)
+        result["image"] = image
         image["num_images"] = len(image_labels_arr)
         image["num_defect_images"] = int(image_labels_arr.sum())
+        image["per_category"] = per_class_reports(
+            image_labels_arr, image_scores_arr, image_cats, image["threshold"], self._cat_name
+        )
 
         if len(self.pro_maps) >= 2:
             result["pro"] = compute_pro(
@@ -588,7 +683,7 @@ class AnomalyEvaluator:
 
         if self.cfg.error_tiles > 0 and self.cfg.error_dir:
             result["errors"] = self._dump_errors(
-                tile.get("best_threshold"), pixel_threshold
+                tile.get("threshold"), pixel_threshold
             )
         return result
 
@@ -620,6 +715,52 @@ def format_metrics(result: dict[str, Any]) -> str:
     if "f1_at_threshold" in result["pixel"]:
         lines.append(f"P-F1@val-thr={fmt(result['pixel']['f1_at_threshold'])}")
     return " | ".join(lines)
+
+
+_DETECTION_KEYS = (
+    "auroc", "ap", "precision", "recall", "f1", "accuracy",
+    "tp", "fp", "fn", "tn", "threshold", "f1_best", "positives", "negatives",
+)
+_PIXEL_KEYS = ("auroc", "ap", "f1", "f1_at_threshold", "best_threshold")
+_PIXEL_CLASS_KEYS = ("auroc", "ap", "f1", "pixels")
+
+
+def to_tracking_metrics(result: dict[str, Any], split: str) -> dict[str, Any]:
+    """Map an evaluator result onto the shared MLflow key schema.
+
+    ``{split}/{level}/{metric}`` and ``{split}/{level}/class/{class_slug}/{metric}``
+    for level in tile/image/pixel (+ ``pixel/aupro``). Returned nested; flatten
+    with :func:`dinomaly.tracking.log_metrics_dict`.
+    """
+    from .tracking import slug
+
+    out: dict[str, Any] = {}
+    for level in ("tile", "image"):
+        node = result.get(level) or {}
+        entry = {k: node[k] for k in _DETECTION_KEYS if k in node}
+        classes = {
+            slug(name): {k: values[k] for k in _DETECTION_KEYS if k in values}
+            for name, values in (node.get("per_category") or {}).items()
+        }
+        if classes:
+            entry["class"] = classes
+        if level == "image":
+            for k in ("num_images", "num_defect_images"):
+                if k in node:
+                    entry[k] = node[k]
+        out[level] = entry
+    pixel = result.get("pixel") or {}
+    pentry: dict[str, Any] = {k: pixel[k] for k in _PIXEL_KEYS if k in pixel}
+    pentry["aupro"] = result.get("pro")
+    pclasses = {
+        slug(name): {k: values[k] for k in _PIXEL_CLASS_KEYS if k in values}
+        for name, values in (pixel.get("per_category") or {}).items()
+    }
+    if pclasses:
+        pentry["class"] = pclasses
+    out["pixel"] = pentry
+    out["tile"]["num_tiles"] = result.get("num_tiles")
+    return {split: out}
 
 
 def evaluate_loader(
@@ -654,4 +795,8 @@ def evaluate_loader(
                 images=images if cfg.error_tiles > 0 else None,
                 tile_ids=batch.get("tile_id"),
             )
-    return evaluator.compute(pixel_threshold=pixel_threshold)
+    return evaluator.compute(
+        pixel_threshold=pixel_threshold,
+        tile_threshold=tile_threshold,
+        image_threshold=image_threshold,
+    )
