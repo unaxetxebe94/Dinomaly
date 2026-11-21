@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pandas as pd
 import torch
 
-from dinomaly.data import TileDataset, make_loader, sample_eval_tiles, split_frames
+from dinomaly.data import TileDataset, make_loader, release_loader_workers, sample_eval_tiles, split_frames
 from dinomaly.engine import Trainer, load_checkpoint
 from dinomaly.metrics import EvalConfig, evaluate_loader, format_metrics, to_tracking_metrics
 from dinomaly.model import build_model
@@ -203,6 +203,7 @@ def train(args, config, tiles_dir: Path, run_dir: Path, logger, tracker: Tracker
     if args.resume:
         trainer.resume(args.resume)
     metrics = trainer.fit()
+    release_loader_workers(train_loader, val_loader)
     save_json(metrics, run_dir / "val_metrics.json")
     logger.info(f"Validation: {format_metrics(metrics)}")
 

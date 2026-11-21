@@ -134,6 +134,21 @@ def make_loader(
     )
 
 
+def release_loader_workers(*loaders: DataLoader | None) -> None:
+    """Stop the persistent worker processes of finished loaders.
+
+    On Windows every worker is a full Python+torch process; leaving the train/val
+    workers alive while the test loader spawns its own can exhaust the commit limit
+    (WinError 1455 "paging file too small").
+    """
+    for loader in loaders:
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+        if loader is not None:
+            loader._iterator = None
+
+
 def sample_eval_tiles(
     frame: pd.DataFrame,
     max_tiles: int | None,
